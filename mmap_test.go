@@ -219,10 +219,8 @@ func TestRefCounting(t *testing.T) {
 	}
 
 	store, m, err := OpenStoreCollection(tmpDir, StoreOptions{
-		CollectionOptions:    co,
-		CompactionPercentage: 10000.0,
-	}, StorePersistOptions{
-		CompactionConcern: CompactionAllow,
+		CollectionOptions: co}, StorePersistOptions{
+		CompactionConcern: CompactionDisable,
 	})
 	if err != nil || m == nil || store == nil {
 		t.Errorf("expected open empty store collection to work")
