@@ -298,7 +298,7 @@ var DefaultCollectionOptions = CollectionOptions{
 	MinMergePercentage:     0.8,
 	MaxPreMergerBatches:    10,
 	MergerCancelCheckEvery: 10000,
-	MergerIdleRunTimeoutMS: 0,
+	MergerIdleRunTimeoutMS: 2000,
 	Debug: 0,
 	Log:   nil,
 }
@@ -578,6 +578,7 @@ type CollectionStats struct {
 	TotMergerInternalSkip         uint64
 	TotMergerLowerLevelNotify     uint64
 	TotMergerLowerLevelNotifySkip uint64
+	TotMergerIdleKicks            uint64
 
 	TotMergerWaitIncomingBeg  uint64
 	TotMergerWaitIncomingStop uint64

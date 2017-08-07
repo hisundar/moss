@@ -29,7 +29,7 @@ type collection struct {
 	doneMergerCh         chan struct{}
 	donePersisterCh      chan struct{}
 	idleMergerTimer      *time.Timer
-	idleMergeAlreadyDone bool
+	idleMergeAlreadyDone int32
 
 	m sync.Mutex // Protects the fields that follow.
 

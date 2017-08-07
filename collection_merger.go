@@ -58,6 +58,8 @@ func (m *collection) runMerger() {
 		pings = pings[0:0]
 	}()
 
+	go m.idleMergerWaker()
+
 OUTER:
 	for {
 		atomic.AddUint64(&m.stats.TotMergerLoop, 1)
@@ -163,6 +165,33 @@ OUTER:
 // It is set to 24 hours by default.
 var MaxIdleRunTimeoutMS int64 = 86400000
 
+func (m *collection) idleMergerWaker() {
+	idleTimeout := m.options.MergerIdleRunTimeoutMS
+	if idleTimeout == 0 {
+		idleTimeout = DefaultCollectionOptions.MergerIdleRunTimeoutMS
+	}
+	if idleTimeout <= 0 || MaxIdleRunTimeoutMS <= idleTimeout {
+		return
+	}
+	for {
+		if atomic.LoadUint64(&m.stats.TotCloseBeg) > 0 {
+			return
+		}
+		atomic.AddUint64(&m.stats.TotMergerIdleSleeps, 1)
+		napIDBefore := atomic.LoadUint64(&m.stats.TotMergerWaitIncomingEnd)
+
+		time.Sleep(time.Duration(idleTimeout) * time.Millisecond)
+
+		napIDAfter := atomic.LoadUint64(&m.stats.TotMergerWaitIncomingEnd)
+		napID := atomic.LoadUint64(&m.stats.TotMergerWaitIncomingBeg)
+		if napID == napIDAfter+1 && // Merger is indeed asleep.
+			napIDBefore == napIDAfter && // Nap only while merger naps.
+			atomic.LoadInt32(&m.idleMergeAlreadyDone) == 0 {
+			m.NotifyMerger("from-idle-merger", false)
+		}
+	}
+}
+
 // mergerWaitForWork() is a helper method that blocks until there's
 // either pings or incoming segments (from ExecuteBatch()) of work for
 // the merger.
@@ -182,28 +211,6 @@ func (m *collection) mergerWaitForWork(pings []ping) (
 	if waitDirtyIncomingCh != nil {
 		atomic.AddUint64(&m.stats.TotMergerWaitIncomingBeg, 1)
 
-		var idleTimerCh <-chan time.Time
-		var idleWake bool
-
-		idleTimeout := m.options.MergerIdleRunTimeoutMS
-		if idleTimeout == 0 {
-			idleTimeout = DefaultCollectionOptions.MergerIdleRunTimeoutMS
-		}
-		if m.idleMergeAlreadyDone {
-			idleTimeout = 0
-		} else if 0 < idleTimeout && idleTimeout < MaxIdleRunTimeoutMS {
-			sleepDuration := time.Duration(idleTimeout) * time.Millisecond
-			// Note this need not be protected under a lock as long as there
-			// is just 1 collection merger go routine per collection.
-			if m.idleMergerTimer == nil {
-				m.idleMergerTimer = time.NewTimer(sleepDuration)
-			} else {
-				m.idleMergerTimer.Reset(sleepDuration)
-			}
-			idleTimerCh = m.idleMergerTimer.C
-			atomic.AddUint64(&m.stats.TotMergerIdleSleeps, 1)
-		}
-
 		select {
 		case <-m.stopCh:
 			atomic.AddUint64(&m.stats.TotMergerWaitIncomingStop, 1)
@@ -213,23 +220,14 @@ func (m *collection) mergerWaitForWork(pings []ping) (
 			pings = append(pings, pingVal)
 			if pingVal.kind == "mergeAll" {
 				mergeAll = true
+			} else if pingVal.kind == "from-idle-merger" {
+				atomic.AddUint64(&m.stats.TotMergerIdleRuns, 1)
+				atomic.StoreInt32(&m.idleMergeAlreadyDone, 1)
+				mergeAll = true
 			}
 
 		case <-waitDirtyIncomingCh:
 			// NO-OP.
-
-		case <-idleTimerCh:
-			atomic.AddUint64(&m.stats.TotMergerIdleRuns, 1)
-			idleWake = true
-			mergeAll = true // While idle, might as well merge/compact.
-			// To avoid hogging resources disable idle wakeups after 1 run.
-			m.idleMergeAlreadyDone = true
-		}
-
-		if 0 < idleTimeout && idleTimeout < MaxIdleRunTimeoutMS && !idleWake {
-			if !m.idleMergerTimer.Stop() {
-				<-idleTimerCh // Drain the channel for a clean Reset next time.
-			}
 		}
 
 		atomic.AddUint64(&m.stats.TotMergerWaitIncomingEnd, 1)
@@ -282,10 +280,12 @@ func (m *collection) mergerMain(stackDirtyMid, stackDirtyBase *segmentStack,
 		stackDirtyMidPrev.Close()
 
 		// Since new mutations have come in, re-enable idle wakeups.
-		m.idleMergeAlreadyDone = false
+		atomic.StoreInt32(&m.idleMergeAlreadyDone, 0)
 	} else {
 		if stackDirtyMid != nil && stackDirtyMid.isEmpty() &&
-			m.idleMergeAlreadyDone { // Do this only for idle-compactions.
+			atomic.LoadInt32(&m.idleMergeAlreadyDone) != 0 {
+			// Do this only for idle-compactions.
+			atomic.AddUint64(&m.stats.TotMergerIdleKicks, 1)
 			m.m.Lock() // Allow an empty stackDirtyMid to kick persistence.
 			stackDirtyMidPrev := m.stackDirtyMid
 			m.stackDirtyMid = stackDirtyMid
@@ -329,10 +329,12 @@ func (m *collection) mergerNotifyPersister() {
 		m.stackDirtyBase = m.stackDirtyMid
 		m.stackDirtyMid = nil
 
-		prevLowerLevelSnapshot := m.stackDirtyBase.lowerLevelSnapshot
-		m.stackDirtyBase.lowerLevelSnapshot = m.lowerLevelSnapshot.addRef()
-		if prevLowerLevelSnapshot != nil {
-			prevLowerLevelSnapshot.decRef()
+		if !m.stackDirtyBase.isEmpty() {
+			prevLowerLevelSnapshot := m.stackDirtyBase.lowerLevelSnapshot
+			m.stackDirtyBase.lowerLevelSnapshot = m.lowerLevelSnapshot.addRef()
+			if prevLowerLevelSnapshot != nil {
+				prevLowerLevelSnapshot.decRef()
+			}
 		}
 
 		if m.waitDirtyOutgoingCh != nil {
